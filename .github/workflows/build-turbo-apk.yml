@@ -1,0 +1,274 @@
+name: Build Winlator Frost 25W APK
+
+# Winlator Frost 25W 云端构建流水线（手动触发）
+# 设计要点：
+#   1. 上游 brunodev85/winlator-app 仓库已内置全部运行时 assets（rootfs.tzst / wincomponents/direct3d.tzst /
+#      container_pattern.tzst 等，共 85 个文件），因此本流水线不再下载官方 APK、不再注入 assets，
+#      只做“校验内置运行时资产存在且体积正常”，失败即中断，避免生成打开即闪退的残缺包。
+#   2. 版本 / compileSdk / NDK / CMake 全部从 app/build.gradle 动态解析并带默认值，上游升级不容易断流。
+#   3. 产物统一 zipalign -p -f 4 + apksigner --v1/--v2/--v3 签名，并做 apksigner verify 校验。
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "自定义应用名称"
+        required: true
+        default: "Winlator Frost 25W"
+      package_id:
+        description: "包名：默认 com.winlator.frost25w（与原版共存）；进阶可填 com.ludashi.benchmark"
+        required: true
+        default: "com.winlator.frost25w"
+      create_release:
+        description: "构建成功后自动发布到 GitHub Releases（手机浏览器直链下载）"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-frost-apk:
+    name: Build / Sign / Release (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: "1. 检出源码 (Checkout)"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: "2. 清理预装组件释放磁盘空间"
+        run: |
+          set -euo pipefail
+          echo "=== 清理前 ==="
+          df -h /
+          # 删除用不到的预装组件，并删掉 Runner 自带的旧 NDK / CMake，稍后安装与 app/build.gradle 精确匹配的版本
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android/sdk/ndk \
+            /usr/local/lib/android/sdk/cmake || true
+          echo "=== 清理后 ==="
+          df -h /
+
+      - name: "3. 从 app/build.gradle 解析版本 / compileSdk / NDK / CMake"
+        id: versions
+        run: |
+          set -euo pipefail
+          GRADLE_FILE="app/build.gradle"
+          if [ ! -f "$GRADLE_FILE" ]; then
+            echo "::error::未找到 $GRADLE_FILE，请确认 fork 的是 brunodev85/winlator-app 完整仓库"
+            exit 1
+          fi
+
+          # 补丁前的 versionName（如 11.2），用于产物命名与 Release tag
+          APP_VERSION=$(grep -oP "versionName\s+[\"']\K[^\"']+" "$GRADLE_FILE" | head -n1 || true)
+          COMPILE_SDK=$(grep -oP 'compileSdk(?:Version)?\s+\K\d+' "$GRADLE_FILE" | head -n1 || true)
+          NDK_VER=$(grep -oP "ndkVersion\s+['\"]\K[^'\"]+" "$GRADLE_FILE" | head -n1 || true)
+          CMAKE_VER=$(sed -n '/externalNativeBuild[[:space:]]*{/,/}/p' "$GRADLE_FILE" \
+            | grep -oP "version\s+['\"]\K[0-9]+\.[0-9]+\.[0-9]+" | head -n1 || true)
+
+          # 解析失败时使用已核实的默认值（winlator-app v11.2）
+          APP_VERSION="${APP_VERSION:-11.2}"
+          COMPILE_SDK="${COMPILE_SDK:-35}"
+          NDK_VER="${NDK_VER:-24.0.8215888}"
+          CMAKE_VER="${CMAKE_VER:-3.22.1}"
+          BUILD_TOOLS="${COMPILE_SDK}.0.0"
+
+          {
+            echo "app_version=${APP_VERSION}"
+            echo "compile_sdk=${COMPILE_SDK}"
+            echo "build_tools=${BUILD_TOOLS}"
+            echo "ndk_ver=${NDK_VER}"
+            echo "cmake_ver=${CMAKE_VER}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "解析结果：app_version=${APP_VERSION}, compileSdk=${COMPILE_SDK}, build-tools=${BUILD_TOOLS}, NDK=${NDK_VER}, CMake=${CMAKE_VER}"
+
+      - name: "4. 安装 JDK 17 并启用 Gradle 缓存"
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: "5. 初始化 Android SDK 命令行工具"
+        uses: android-actions/setup-android@v4
+
+      - name: "6. 安装 platform / build-tools / NDK / CMake"
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platforms;android-${{ steps.versions.outputs.compile_sdk }}" \
+            "build-tools;${{ steps.versions.outputs.build_tools }}" \
+            "ndk;${{ steps.versions.outputs.ndk_ver }}" \
+            "cmake;${{ steps.versions.outputs.cmake_ver }}"
+          echo "=== 已安装的关键 SDK 包 ==="
+          sdkmanager --list_installed 2>/dev/null | grep -E "platforms;android|build-tools|ndk;|cmake;" || true
+
+      - name: "7. 校验内置运行时资产（缺一即失败）"
+        run: |
+          set -euo pipefail
+          ASSETS_DIR="app/src/main/assets"
+          if [ ! -d "$ASSETS_DIR" ]; then
+            echo "::error::$ASSETS_DIR 不存在：请确认 fork 的是官方 winlator-app 完整仓库（运行时 assets 已内置）"
+            exit 1
+          fi
+
+          FAILED=0
+          check_asset() {
+            local rel="$1"
+            local min_mb="$2"
+            local f="$ASSETS_DIR/$rel"
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少内置运行时资产：$rel"
+              FAILED=1
+              return
+            fi
+            local size_mb
+            # 用 stat 取文件真实字节数换算 MB（du 统计的是磁盘占用，稀疏文件会误报 0）
+            size_mb=$(stat -c%s "$f" | awk '{ printf "%d", $1 / 1048576 }')
+            echo "  [OK] $rel  ${size_mb} MB"
+            if [ "$size_mb" -lt "$min_mb" ]; then
+              echo "::error::$rel 体积异常（${size_mb}MB < ${min_mb}MB），可能是 Git LFS / 稀疏克隆导致不完整"
+              FAILED=1
+            fi
+          }
+
+          # 核心运行时镜像（官方 v11.2.0 assets 对应体积：62.2MB / 29.8MB / 7.1MB）
+          check_asset "rootfs.tzst" 50
+          check_asset "wincomponents/direct3d.tzst" 20
+          check_asset "container_pattern.tzst" 5
+
+          # 其他关键运行时目录只校验存在性（版本号随上游可能变化，避免硬编码文件名造成误报失败）
+          for rel in \
+            "box64/default.box64rc" \
+            "graphics_driver" \
+            "dxwrapper" \
+            "wincomponents" ; do
+            if [ ! -e "$ASSETS_DIR/$rel" ]; then
+              echo "::error::缺少内置运行时资产：$rel"
+              FAILED=1
+            fi
+          done
+
+          echo "=== 运行时资产总览 ==="
+          du -sh "$ASSETS_DIR"
+          echo "资产文件总数：$(find "$ASSETS_DIR" -type f | wc -l)（官方 v11.2.0 为 85 个）"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::内置运行时资产校验失败，终止构建（不要生成打开即闪退的 APK）"
+            exit 1
+          fi
+          echo "内置运行时资产校验通过 ✅"
+
+      - name: "8. 应用 Winlator Frost 25W 自动化补丁"
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          PACKAGE_ID: ${{ github.event.inputs.package_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/apply_turbo_patches.py ]; then
+            echo "::error::未找到 scripts/apply_turbo_patches.py，请先把补丁引擎放到 fork 仓库 scripts/ 目录"
+            exit 1
+          fi
+          python3 scripts/apply_turbo_patches.py \
+            --root . \
+            --app-name "$APP_NAME" \
+            --package-id "$PACKAGE_ID" \
+            --version-suffix "frost25w"
+
+      - name: "9. 编译 Release APK（arm64-v8a）"
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: "10. zipalign + apksigner 签名并校验"
+        id: sign
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_DIR" ]; then
+            echo "::error::ANDROID_HOME / ANDROID_SDK_ROOT 未设置"
+            exit 1
+          fi
+          BT_DIR="$SDK_DIR/build-tools/${{ steps.versions.outputs.build_tools }}"
+          if [ ! -x "$BT_DIR/zipalign" ] || [ ! -x "$BT_DIR/apksigner" ]; then
+            echo "::error::找不到 build-tools 工具：$BT_DIR"
+            exit 1
+          fi
+
+          RAW_APK=$(find app/build/outputs/apk/release -maxdepth 2 -name "*.apk" 2>/dev/null | head -n1 || true)
+          if [ -z "$RAW_APK" ] || [ ! -f "$RAW_APK" ]; then
+            echo "::error::未找到 assembleRelease 产物 APK"
+            exit 1
+          fi
+          echo "构建产物：$RAW_APK"
+
+          KEYSTORE="$RUNNER_TEMP/frost25w-release.jks"
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass frost25w2026 \
+            -keypass frost25w2026 \
+            -alias frost25w \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Winlator Frost 25W, OU=Gaming, O=CustomBuild, L=CN, ST=CN, C=CN"
+
+          OUT_NAME="Winlator-Frost25W-${{ steps.versions.outputs.app_version }}-arm64-signed.apk"
+          ALIGNED="$RUNNER_TEMP/frost25w-aligned.apk"
+          mkdir -p dist
+
+          "$BT_DIR/zipalign" -p -f 4 "$RAW_APK" "$ALIGNED"
+          "$BT_DIR/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias frost25w \
+            --ks-pass pass:frost25w2026 \
+            --key-pass pass:frost25w2026 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "dist/$OUT_NAME" \
+            "$ALIGNED"
+          "$BT_DIR/apksigner" verify --verbose "dist/$OUT_NAME"
+
+          rm -f "$ALIGNED" "$KEYSTORE"
+          echo "apk_path=dist/$OUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$OUT_NAME" >> "$GITHUB_OUTPUT"
+          ls -lh "dist/$OUT_NAME"
+
+      - name: "11. 上传签名 APK Artifact"
+        uses: actions/upload-artifact@v7
+        with:
+          name: winlator-frost25w-apk
+          path: ${{ steps.sign.outputs.apk_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: "12. 发布 GitHub Release（可选）"
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: "frost25w-${{ steps.versions.outputs.app_version }}-b${{ github.run_number }}"
+          name: "Winlator Frost 25W ${{ steps.versions.outputs.app_version }} (Build #${{ github.run_number }})"
+          body: |
+            ### 🧊 Winlator Frost 25W 满血定制版 APK
+
+            - **应用名称**：`${{ github.event.inputs.app_name }}`
+            - **包名**：`${{ github.event.inputs.package_id }}`
+            - **版本**：`${{ steps.versions.outputs.app_version }}`（基于官方 v11.2 运行时，assets 已内置：rootfs / Turnip / Vortek / Wine / Box64）
+            - **构建编号**：`#${{ github.run_number }}`
+            - **核心特性**：
+              - 内置 `Frost 25W Extreme` Box64 极限预设（BIGBLOCK=3 / FORWARD=512 / AVX=1 / 全 8 核）
+              - 原生最高刷新率锁定（120Hz / 144Hz）+ 挖孔屏全屏 + 屏幕常亮
+              - 扩展 `1600x720 (20:9)` / `1920x1080 (16:9)` 与 6GB / 8GB 虚拟显存
+              - 注入 NVIDIA GeForce RTX 4090 / 4080 / 4070 显卡伪装 ID
+              - 寒冰赛博深空蓝主题（#0B0F19 / #00E5FF）
+            - **安装说明**：下载 `*-arm64-signed.apk` 直接安装；首次启动解压内置镜像约 40–90 秒，请保持前台。
+          files: ${{ steps.sign.outputs.apk_path }}
+          draft: false
+          prerelease: false
